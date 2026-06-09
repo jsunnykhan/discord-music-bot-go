@@ -422,9 +422,10 @@ func resolveWithYtDlp(target string) (string, error) {
 		target = "ytsearch:" + target
 	}
 
-	log.Printf("🔍 [YT-DLP] Executing environment call for string element target matching: %s", target)
-	shellCmd := fmt.Sprintf("/usr/local/bin/yt-dlp -f bestaudio -g %q", target)
-	cmd := exec.Command("sh", "-c", shellCmd)
+	log.Printf("🔍 [YT-DLP] Executing native binary call for: %s", target)
+
+	// Native invocation bypasses shell double-quoting bugs entirely
+	cmd := exec.Command("/usr/local/bin/yt-dlp", "-f", "bestaudio", "-g", target)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
