@@ -21,7 +21,6 @@ type GuildPlayer struct {
 	session        *discordgo.Session
 	voiceConn      *discordgo.VoiceConnection
 	encodeSession  *dca.EncodeSession
-	currentStream  *dca.StreamingSession
 	isPlaying      bool
 	isPaused       bool
 	voiceChannelID string
@@ -110,13 +109,12 @@ func (p *GuildPlayer) Pause() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.isPlaying || p.currentStream == nil {
+	if !p.isPlaying {
 		return fmt.Errorf("nothing is playing")
 	}
 	if p.isPaused {
 		return nil
 	}
-	p.currentStream.SetPaused(true)
 	p.isPaused = true
 
 	rdb.SetPlayerState(context.Background(), p.GuildID, map[string]interface{}{"is_paused": "true"})
@@ -128,13 +126,12 @@ func (p *GuildPlayer) Resume() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.isPlaying || p.currentStream == nil {
+	if !p.isPlaying {
 		return fmt.Errorf("nothing is playing")
 	}
 	if !p.isPaused {
 		return nil
 	}
-	p.currentStream.SetPaused(false)
 	p.isPaused = false
 
 	rdb.SetPlayerState(context.Background(), p.GuildID, map[string]interface{}{"is_paused": "false"})
@@ -166,43 +163,84 @@ func (p *GuildPlayer) stopPlaybackLocked() {
 		p.encodeSession.Cleanup()
 		p.encodeSession = nil
 	}
-	p.currentStream = nil
 	p.isPaused = false
 }
 
 // runPlaybackLoop dequeues and plays tracks sequentially until the queue is empty.
+// func (p *GuildPlayer) runPlaybackLoop() {
+// 	ctx := context.Background()
+
+// 	for {
+// 		track, err := rdb.DequeueTrack(ctx, p.GuildID)
+// 		if err != nil {
+// 			log.Printf("Dequeue error (guild %s): %v", p.GuildID, err)
+// 			break
+// 		}
+// 		if track == nil {
+// 			break // queue empty
+// 		}
+
+// 		p.mu.Lock()
+// 		if p.voiceConn == nil {
+// 			p.mu.Unlock()
+// 			log.Printf("Playback loop ending (guild %s): no voice connection", p.GuildID)
+// 			break
+// 		}
+// 		p.mu.Unlock()
+
+// 		if err := p.playTrack(track); err != nil {
+// 			log.Printf("Playback error on '%s': %v", track.Title, err)
+// 			p.sendError(err.Error())
+// 		}
+// 	}
+
+// 	p.mu.Lock()
+// 	p.isPlaying = false
+// 	p.stopPlaybackLocked()
+// 	p.mu.Unlock()
+
+// 	rdb.ClearPlayerState(ctx, p.GuildID)
+// }
+
 func (p *GuildPlayer) runPlaybackLoop() {
 	ctx := context.Background()
+	log.Println("🔄 [DEBUG] runPlaybackLoop has successfully started!")
 
 	for {
+		log.Println("🔄 [DEBUG] Attempting to fetch next track from Redis...")
 		track, err := rdb.DequeueTrack(ctx, p.GuildID)
 		if err != nil {
-			log.Printf("Dequeue error (guild %s): %v", p.GuildID, err)
+			log.Printf("❌ [DEBUG] Dequeue error (guild %s): %v", p.GuildID, err)
 			break
 		}
 		if track == nil {
-			break // queue empty
+			log.Println("ℹ️ [DEBUG] Redis queue is empty. Ending loop.")
+			break
 		}
+
+		log.Printf("🎵 [DEBUG] Found track in queue: %s (URL: %s)", track.Title, track.URL)
 
 		p.mu.Lock()
 		if p.voiceConn == nil {
 			p.mu.Unlock()
-			log.Printf("Playback loop ending (guild %s): no voice connection", p.GuildID)
+			log.Printf("❌ [DEBUG] Voice connection is NIL for guild %s. Exiting loop.", p.GuildID)
 			break
 		}
 		p.mu.Unlock()
 
+		log.Println("🚀 [DEBUG] Handing track off to playTrack()...")
 		if err := p.playTrack(track); err != nil {
-			log.Printf("Playback error on '%s': %v", track.Title, err)
+			log.Printf("❌ [DEBUG] Playback error on '%s': %v", track.Title, err)
 			p.sendError(err.Error())
 		}
+		log.Println("🏁 [DEBUG] finished processing playTrack() execution loop iteration.")
 	}
 
 	p.mu.Lock()
 	p.isPlaying = false
 	p.stopPlaybackLocked()
 	p.mu.Unlock()
-
+	log.Println("🛑 [DEBUG] runPlaybackLoop has shut down.")
 	rdb.ClearPlayerState(ctx, p.GuildID)
 }
 
@@ -224,7 +262,6 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 			p.encodeSession.Cleanup()
 			p.encodeSession = nil
 		}
-		p.currentStream = nil
 		if minioStream != nil {
 			minioStream.Close()
 		}
@@ -258,10 +295,17 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 
 	p.mu.Lock()
 	p.encodeSession = encSession
-	done := make(chan error, 1)
-	p.currentStream = dca.NewStream(encSession, p.voiceConn, done)
 	p.isPaused = false
+	vc := p.voiceConn
 	p.mu.Unlock()
+
+	// Direct native speaking trigger for modern discordgo engines
+	if err := vc.Speaking(true); err != nil {
+		log.Printf("Warning: failed to establish speaking state: %v", err)
+	}
+	defer func() {
+		_ = vc.Speaking(false)
+	}()
 
 	// Publish "now playing" state in Redis.
 	rdb.SetPlayerState(ctx, p.GuildID, map[string]interface{}{
@@ -269,14 +313,38 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		"is_paused":          "false",
 	})
 
-	select {
-	case err := <-done:
-		if err != nil && err != io.EOF {
-			return err
+	// Frame-copy loop directly to the Opus Engine channel
+	for {
+		select {
+		case <-playCtx.Done():
+			return fmt.Errorf("playback interrupted")
+		default:
 		}
-	case <-playCtx.Done():
-		return fmt.Errorf("playback interrupted")
+
+		p.mu.Lock()
+		paused := p.isPaused
+		p.mu.Unlock()
+
+		if paused {
+			// Small skip block to avoid thread-locking CPU when paused
+			continue
+		}
+
+		frame, err := encSession.OpusFrame()
+		if err != nil {
+			if err == io.EOF {
+				break // End of track
+			}
+			return fmt.Errorf("reading opus frame: %w", err)
+		}
+
+		select {
+		case vc.OpusSend <- frame:
+		case <-playCtx.Done():
+			return fmt.Errorf("playback interrupted during packet stream")
+		}
 	}
+
 	return nil
 }
 
