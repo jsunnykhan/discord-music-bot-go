@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/bwmarrin/discordgo v0.29.0
-	github.com/jonas747/dca v0.0.0-20210930103944-155f5e5f0cc7
+	github.com/cheezecakee/dca v0.0.0-20240722231258-f89cad9038bb
 	github.com/lib/pq v1.12.3
 	github.com/minio/minio-go/v7 v7.2.0
 	github.com/redis/go-redis/v9 v9.20.0
@@ -14,10 +14,12 @@ replace github.com/bwmarrin/discordgo => github.com/yeongaori/discordgo-fork v0.
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/cheezecakee/dca v0.0.0-20240722231258-f89cad9038bb // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/jogramming/ogg v0.0.0-20161220051205-b4f6f4cf3757 // indirect
 	github.com/jonas747/ogg v0.0.0-20161220051205-b4f6f4cf3757 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.11 // indirect

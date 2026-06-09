@@ -9,10 +9,9 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/jonas747/dca"
+	"github.com/cheezecakee/dca"
 )
 
 // GuildPlayer manages voice connections and audio playback for one guild.
@@ -21,7 +20,7 @@ type GuildPlayer struct {
 	mu             sync.Mutex
 	session        *discordgo.Session
 	voiceConn      *discordgo.VoiceConnection
-	encodeSession  *dca.EncodeSession
+	streamSession  *dca.StreamingSession
 	isPlaying      bool
 	isPaused       bool
 	voiceChannelID string
@@ -35,7 +34,7 @@ var (
 	playersMu sync.RWMutex
 )
 
-// GetOrCreatePlayer retrieves or initialises the player for a guild.
+// GetOrCreatePlayer retrieves or initializes the player for a guild.
 func GetOrCreatePlayer(guildID string, s *discordgo.Session) *GuildPlayer {
 	playersMu.Lock()
 	defer playersMu.Unlock()
@@ -60,13 +59,13 @@ func (p *GuildPlayer) Join(channelID string) error {
 	}
 
 	log.Printf("🔌 [INFO] Attempting to join voice channel %s (Guild: %s)...", channelID, p.GuildID)
-	
+
 	vc, err := p.session.ChannelVoiceJoin(context.Background(), p.GuildID, channelID, false, false)
 	if err != nil {
 		log.Printf("❌ [ERROR] Failed to join voice channel %s: %v", channelID, err)
 		return fmt.Errorf("joining voice channel %s: %w", channelID, err)
 	}
-	
+
 	p.voiceConn = vc
 	p.voiceChannelID = channelID
 	log.Printf("✅ [SUCCESS] Successfully connected to voice channel %s", channelID)
@@ -85,12 +84,12 @@ func (p *GuildPlayer) Leave() error {
 
 	log.Printf("🚪 [INFO] Leaving voice channel %s (Guild: %s)", p.voiceChannelID, p.GuildID)
 	p.stopPlaybackLocked()
-	
+
 	err := p.voiceConn.Disconnect(context.Background())
 	if err != nil {
 		log.Printf("❌ [ERROR] Error occurred during voice disconnect: %v", err)
 	}
-	
+
 	p.voiceConn = nil
 	p.isPlaying = false
 	p.isPaused = false
@@ -125,12 +124,12 @@ func (p *GuildPlayer) Play(track *QueueTrack, textChannelID string) error {
 	return nil
 }
 
-// Pause pauses the current stream.
+// Pause pauses the current stream via the StreamingSession interface.
 func (p *GuildPlayer) Pause() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.isPlaying {
+	if !p.isPlaying || p.streamSession == nil {
 		log.Printf("⚠️ [WARN] Pause requested, but nothing is currently playing in Guild %s", p.GuildID)
 		return fmt.Errorf("nothing is playing")
 	}
@@ -138,20 +137,21 @@ func (p *GuildPlayer) Pause() error {
 		log.Printf("ℹ️ [INFO] Pause requested, but playback is already paused.")
 		return nil
 	}
-	
+
 	p.isPaused = true
+	p.streamSession.SetPaused(true)
 	log.Printf("⏸️ [INFO] Playback paused for Guild %s", p.GuildID)
 
 	rdb.SetPlayerState(context.Background(), p.GuildID, map[string]interface{}{"is_paused": "true"})
 	return nil
 }
 
-// Resume unpauses the current stream.
+// Resume unpauses the current stream via the StreamingSession interface.
 func (p *GuildPlayer) Resume() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.isPlaying {
+	if !p.isPlaying || p.streamSession == nil {
 		log.Printf("⚠️ [WARN] Resume requested, but nothing is playing in Guild %s", p.GuildID)
 		return fmt.Errorf("nothing is playing")
 	}
@@ -159,8 +159,9 @@ func (p *GuildPlayer) Resume() error {
 		log.Printf("ℹ️ [INFO] Resume requested, but playback is already running.")
 		return nil
 	}
-	
+
 	p.isPaused = false
+	p.streamSession.SetPaused(false)
 	log.Printf("▶️ [INFO] Playback resumed for Guild %s", p.GuildID)
 
 	rdb.SetPlayerState(context.Background(), p.GuildID, map[string]interface{}{"is_paused": "false"})
@@ -177,24 +178,21 @@ func (p *GuildPlayer) Stop() error {
 	if err := rdb.ClearQueue(ctx, p.GuildID); err != nil {
 		log.Printf("⚠️ [WARN] Error clearing Redis queue on stop: %v", err)
 	}
-	
+
 	p.stopPlaybackLocked()
 	rdb.ClearPlayerState(ctx, p.GuildID)
 	log.Printf("✅ [SUCCESS] Active streams closed and state cleared for Guild %s", p.GuildID)
 	return nil
 }
 
-// stopPlaybackLocked cancels the active context and cleans up the encoder.
+// stopPlaybackLocked cancels the active context and cleans up references.
 func (p *GuildPlayer) stopPlaybackLocked() {
 	log.Printf("🧹 [INFO] Internal cleanup: Stopping encoders and destroying session contexts...")
 	if p.cancelPlay != nil {
 		p.cancelPlay()
 		p.cancelPlay = nil
 	}
-	if p.encodeSession != nil {
-		p.encodeSession.Cleanup()
-		p.encodeSession = nil
-	}
+	p.streamSession = nil
 	p.isPaused = false
 }
 
@@ -242,10 +240,9 @@ func (p *GuildPlayer) runPlaybackLoop() {
 	rdb.ClearPlayerState(ctx, p.GuildID)
 }
 
-// playTrack streams a single track through Discord voice using native memory standard pipes.
+// playTrack streams a single track using automated cheezecakee/dca streaming loop abstractions.
 func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	ctx := context.Background()
-	var minioStream io.ReadCloser
 
 	p.mu.Lock()
 	playCtx, cancel := context.WithCancel(context.Background())
@@ -257,24 +254,17 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		log.Printf("🔲 [TRACK-END] Running deferred cleanup blocks for stream...")
 		cancel()
 		p.mu.Lock()
-		if p.encodeSession != nil {
-			log.Println("🔲 [TRACK-END] Destroying active DCA session frames...")
-			p.encodeSession.Cleanup()
-			p.encodeSession = nil
-		}
-		if minioStream != nil {
-			log.Println("🔲 [TRACK-END] Closing direct MinIO socket streams...")
-			minioStream.Close()
-		}
+		p.streamSession = nil
 		p.mu.Unlock()
 	}()
 
+	// Cloned and configured options preset matching the fork's structural properties
 	opts := dca.StdEncodeOptions
-	opts.RawOutput = true
 	opts.Bitrate = 96
-	opts.Application = dca.AudioApplicationAudio
+	opts.CompressionLevel = 10
 
-	var ffmpegCmd *exec.Cmd
+	var targetPath string
+	var minioStream io.ReadCloser
 	var err error
 
 	if track.Source == "minio" {
@@ -283,70 +273,31 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		if err != nil {
 			return fmt.Errorf("fetching custom track from MinIO: %w", err)
 		}
-		
-		ffmpegCmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "-nostats", "pipe:1")
-		ffmpegCmd.Stdin = minioStream
+		defer minioStream.Close()
+
+		// passing pipe:0 flags FFmpeg to pull from the incoming Reader stream under the hood
+		targetPath = "pipe:0"
 	} else {
 		log.Printf("🌐 [STREAM] Source identified as Web/YT. Resolving link via yt-dlp: '%s'", track.URL)
 		streamURL, resolveErr := resolveWithYtDlp(track.URL)
 		if resolveErr != nil {
 			return fmt.Errorf("resolving web audio source with yt-dlp: %w", resolveErr)
 		}
-		
 		if streamURL == "" {
 			return fmt.Errorf("yt-dlp engine completed but returned an empty stream URL string")
 		}
-
-		log.Printf("🔗 [STREAM] yt-dlp link extraction resolved successfully. Length: %d chars", len(streamURL))
-		
-		ffmpegCmd = exec.Command("ffmpeg", 
-			"-reconnect", "1", 
-			"-reconnect_streamed", "1", 
-			"-reconnect_delay_max", "5", 
-			"-i", streamURL, 
-			"-f", "s16le", 
-			"-ar", "48000", 
-			"-ac", "2", 
-			"-loglevel", "error", 
-			"-nostats", 
-			"pipe:1",
-		)
+		targetPath = streamURL
 	}
 
-	// Create our standard pipe
-	ffmpegStdout, err := ffmpegCmd.StdoutPipe()
+	// Correct EncodeFile implementation using target path strings cleanly
+	log.Println("🎛️ [DCA] Spawning file transcoding sub-process thread wrapper...")
+	encSession, err := dca.EncodeFile(targetPath, opts)
 	if err != nil {
-		return fmt.Errorf("creating internal ffmpeg stdout allocation pipe: %w", err)
+		return fmt.Errorf("transcoding execution memory translation failure: %w", err)
 	}
-
-	var ffmpegStderr bytes.Buffer
-	ffmpegCmd.Stderr = &ffmpegStderr
-
-	log.Println("🎬 [FFMPEG] Initializing external FFmpeg engine process targeting memory pipe...")
-	if err := ffmpegCmd.Start(); err != nil {
-		return fmt.Errorf("failed to execute background ffmpeg context instantiation: %w", err)
-	}
-
-	defer func() {
-		if ffmpegCmd.Process != nil {
-			log.Println("🎬 [FFMPEG] Terminating background FFmpeg worker sub-process.")
-			_ = ffmpegCmd.Process.Kill()
-		}
-	}()
-
-	// STABLE FIX: Instead of calling EncodeMem directly (which crashes due to reading headers twice),
-	// we use dca.EncodeSession natively combined with NewEncodeSession to read smoothly.
-	log.Println("🎛️ [DCA] Creating continuous processing context via streaming session wrapper...")
-	encSession, err := dca.EncodeMem(ffmpegStdout, opts)
-	if err != nil {
-		stderrStr := strings.TrimSpace(ffmpegStderr.String())
-		log.Printf("❌ [FFMPEG-CRASH] Transcoding execution failure: %v (stderr: %s)", err, stderrStr)
-		return fmt.Errorf("transcoding execution memory translation failure: %w (stderr: %s)", err, stderrStr)
-	}
+	defer encSession.Cleanup()
 
 	p.mu.Lock()
-	p.encodeSession = encSession
-	p.isPaused = false
 	vc := p.voiceConn
 	p.mu.Unlock()
 
@@ -364,51 +315,25 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		"is_paused":          "false",
 	})
 
-	log.Printf("🎼 [STREAM-START] Beginning binary packet loop delivery for: '%s'", track.Title)
-	frameCount := 0
+	log.Printf("🎼 [STREAM-START] Beginning automated binary packet loop delivery for: '%s'", track.Title)
 
-	for {
-		select {
-		case <-playCtx.Done():
-			log.Println("🛑 [STREAM-LOOP] Context canceled. Stopping loop delivery.")
-			return fmt.Errorf("playback interrupted")
-		default:
+	doneChan := make(chan error, 1)
+	stream := dca.NewStream(encSession, vc, doneChan)
+
+	p.mu.Lock()
+	p.streamSession = stream
+	p.isPaused = false
+	p.mu.Unlock()
+
+	select {
+	case <-playCtx.Done():
+		log.Println("🛑 [STREAM-LOOP] Context canceled. Stopping loop delivery.")
+		return fmt.Errorf("playback interrupted")
+	case streamErr := <-doneChan:
+		if streamErr != nil && streamErr != io.EOF {
+			return fmt.Errorf("stream context ran into active loop crash: %w", streamErr)
 		}
-
-		p.mu.Lock()
-		paused := p.isPaused
-		p.mu.Unlock()
-
-		if paused {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		frame, err := encSession.OpusFrame()
-		if err != nil {
-			if err == io.EOF {
-				log.Printf("🎉 [STREAM-END] Reached natural EOF of audio stream. Sent total of %d packets.", frameCount)
-				break 
-			}
-			
-			// If FFmpeg errored mid-stream, grab the exact stderr
-			stderrStr := strings.TrimSpace(ffmpegStderr.String())
-			if stderrStr != "" {
-				return fmt.Errorf("error during frame transcode stream loop: %w (ffmpeg context: %s)", err, stderrStr)
-			}
-			return fmt.Errorf("error reading next frame slice from dca buffer stream: %w", err)
-		}
-
-		select {
-		case vc.OpusSend <- frame:
-			frameCount++
-			if frameCount%500 == 0 {
-				log.Printf("🔊 [STREAM-TRACE] Successfully routed %d packets into Opus Engine queue buffers...", frameCount)
-			}
-		case <-playCtx.Done():
-			log.Println("🛑 [STREAM-LOOP] Context dropped during actively running frame transmission.")
-			return fmt.Errorf("playback interrupted during packet stream pipeline delivery")
-		}
+		log.Println("🎉 [STREAM-END] Stream playback finished cleanly.")
 	}
 
 	return nil
@@ -437,7 +362,7 @@ func resolveWithYtDlp(target string) (string, error) {
 	}
 
 	log.Printf("🔍 [YT-DLP] Executing native binary call for: %s", target)
-	
+
 	cmd := exec.Command("/usr/local/bin/yt-dlp", "-f", "bestaudio", "-g", target)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
