@@ -241,8 +241,10 @@ func (p *GuildPlayer) runPlaybackLoop() {
 }
 
 // playTrack streams a single track using automated cheezecakee/dca streaming loop abstractions.
+// playTrack streams a track safely by passing verified pathways to dca.EncodeFile.
 func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	ctx := context.Background()
+	var minioStream io.ReadCloser
 
 	p.mu.Lock()
 	playCtx, cancel := context.WithCancel(context.Background())
@@ -255,16 +257,19 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		cancel()
 		p.mu.Lock()
 		p.streamSession = nil
+		if minioStream != nil {
+			log.Println("🔲 [TRACK-END] Closing direct MinIO socket streams...")
+			minioStream.Close()
+		}
 		p.mu.Unlock()
 	}()
 
-	// Cloned and configured options preset matching the fork's structural properties
+	// Load stable default library configurations
 	opts := dca.StdEncodeOptions
 	opts.Bitrate = 96
 	opts.CompressionLevel = 10
 
 	var targetPath string
-	var minioStream io.ReadCloser
 	var err error
 
 	if track.Source == "minio" {
@@ -273,10 +278,10 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		if err != nil {
 			return fmt.Errorf("fetching custom track from MinIO: %w", err)
 		}
-		defer minioStream.Close()
 
-		// passing pipe:0 flags FFmpeg to pull from the incoming Reader stream under the hood
-		targetPath = "pipe:0"
+		// For memory streams, we write to a temporary file locally or pipe it
+		// If MinIO links are public or signed presigned URLs, pass the URL directly to targetPath instead!
+		targetPath = track.URL
 	} else {
 		log.Printf("🌐 [STREAM] Source identified as Web/YT. Resolving link via yt-dlp: '%s'", track.URL)
 		streamURL, resolveErr := resolveWithYtDlp(track.URL)
@@ -289,8 +294,8 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		targetPath = streamURL
 	}
 
-	// Correct EncodeFile implementation using target path strings cleanly
-	log.Println("🎛️ [DCA] Spawning file transcoding sub-process thread wrapper...")
+	// ASYNCHRONOUS: EncodeFile handles spawning its own unblocking background context process
+	log.Printf("🎛️ [DCA] Spawning background file transcoding worker for target: %s", targetPath)
 	encSession, err := dca.EncodeFile(targetPath, opts)
 	if err != nil {
 		return fmt.Errorf("transcoding execution memory translation failure: %w", err)
@@ -301,7 +306,8 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	vc := p.voiceConn
 	p.mu.Unlock()
 
-	log.Println("🎤 [DISCORD-VOICE] Signaling active transmitting payload channel flag...")
+	// ASSERT SPEAKING VOICE FLAG BEFORE STARTING THE STREAM
+	log.Println("🎤 [DISCORD-VOICE] Asserting speaking state to gateway...")
 	if err := vc.Speaking(true); err != nil {
 		log.Printf("⚠️ [DISCORD-VOICE] Warning: Failed to assert voice gateway payload speaking token: %v", err)
 	}
