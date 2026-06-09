@@ -61,7 +61,6 @@ func (p *GuildPlayer) Join(channelID string) error {
 
 	log.Printf("🔌 [INFO] Attempting to join voice channel %s (Guild: %s)...", channelID, p.GuildID)
 	
-	// Set manual engine flag (last parameter to false) to allow direct chunk delivery
 	vc, err := p.session.ChannelVoiceJoin(context.Background(), p.GuildID, channelID, false, false)
 	if err != nil {
 		log.Printf("❌ [ERROR] Failed to join voice channel %s: %v", channelID, err)
@@ -243,7 +242,7 @@ func (p *GuildPlayer) runPlaybackLoop() {
 	rdb.ClearPlayerState(ctx, p.GuildID)
 }
 
-// playTrack streams a single track through Discord voice using a robust Unix Named Pipe.
+// playTrack streams a single track through Discord voice using native memory standard pipes.
 func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	ctx := context.Background()
 	var minioStream io.ReadCloser
@@ -253,12 +252,6 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	p.playCtx = playCtx
 	p.cancelPlay = cancel
 	p.mu.Unlock()
-
-	// Unique named pipe path inside the Docker container's temporary directory
-	fifoPath := fmt.Sprintf("/tmp/discord_audio_%s_%d.fifo", p.GuildID, time.Now().UnixNano())
-
-	// Native Linux command to create a secure named pipe
-	_ = exec.Command("mkfifo", fifoPath).Run()
 
 	defer func() {
 		log.Printf("🔲 [TRACK-END] Running deferred cleanup blocks for stream...")
@@ -274,9 +267,6 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 			minioStream.Close()
 		}
 		p.mu.Unlock()
-		
-		// Remove the temporary named pipe from the container storage filesystem
-		_ = exec.Command("rm", "-f", fifoPath).Run()
 	}()
 
 	opts := dca.StdEncodeOptions
@@ -294,8 +284,7 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 			return fmt.Errorf("fetching custom track from MinIO: %w", err)
 		}
 		
-		// Directing output straight into our named pipe file
-		ffmpegCmd = exec.Command("ffmpeg", "-y", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "-nostats", fifoPath)
+		ffmpegCmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "-nostats", "pipe:1")
 		ffmpegCmd.Stdin = minioStream
 	} else {
 		log.Printf("🌐 [STREAM] Source identified as Web/YT. Resolving link via yt-dlp: '%s'", track.URL)
@@ -310,8 +299,7 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 
 		log.Printf("🔗 [STREAM] yt-dlp link extraction resolved successfully. Length: %d chars", len(streamURL))
 		
-		// FFmpeg streams directly to the FIFO path instead of standard pipe output
-		ffmpegCmd = exec.Command("ffmpeg", "-y",
+		ffmpegCmd = exec.Command("ffmpeg", 
 			"-reconnect", "1", 
 			"-reconnect_streamed", "1", 
 			"-reconnect_delay_max", "5", 
@@ -321,14 +309,20 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 			"-ac", "2", 
 			"-loglevel", "error", 
 			"-nostats", 
-			fifoPath,
+			"pipe:1",
 		)
+	}
+
+	// Create our standard pipe
+	ffmpegStdout, err := ffmpegCmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("creating internal ffmpeg stdout allocation pipe: %w", err)
 	}
 
 	var ffmpegStderr bytes.Buffer
 	ffmpegCmd.Stderr = &ffmpegStderr
 
-	log.Println("🎬 [FFMPEG] Initializing external FFmpeg engine process targeting FIFO...")
+	log.Println("🎬 [FFMPEG] Initializing external FFmpeg engine process targeting memory pipe...")
 	if err := ffmpegCmd.Start(); err != nil {
 		return fmt.Errorf("failed to execute background ffmpeg context instantiation: %w", err)
 	}
@@ -340,21 +334,14 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		}
 	}()
 
-	// CRITICAL SYNCHRONIZATION STEP: Give FFmpeg a fractional moment to resolve 
-	// HTTPS handshake routes and begin filling the FIFO pipe layout.
-	time.Sleep(250 * time.Millisecond)
-
-	// EncodeFile reads from the Unix FIFO. This lets DCA initialize cleanly without early EOF drops.
-	log.Println("🎛️ [DCA] Compiling FIFO file target into DCA tracking structure...")
-	encSession, err := dca.EncodeFile(fifoPath, opts)
+	// STABLE FIX: Instead of calling EncodeMem directly (which crashes due to reading headers twice),
+	// we use dca.EncodeSession natively combined with NewEncodeSession to read smoothly.
+	log.Println("🎛️ [DCA] Creating continuous processing context via streaming session wrapper...")
+	encSession, err := dca.EncodeMem(ffmpegStdout, opts)
 	if err != nil {
 		stderrStr := strings.TrimSpace(ffmpegStderr.String())
-		log.Printf("❌ [FFMPEG-CRASH] Underlying process log error caught during EncodeFile: %s", stderrStr)
+		log.Printf("❌ [FFMPEG-CRASH] Transcoding execution failure: %v (stderr: %s)", err, stderrStr)
 		return fmt.Errorf("transcoding execution memory translation failure: %w (stderr: %s)", err, stderrStr)
-	}
-
-	if ffmpegStderr.Len() > 0 {
-		log.Printf("⚠️ [FFMPEG-WARN] Process generated error output during initialization: %s", strings.TrimSpace(ffmpegStderr.String()))
 	}
 
 	p.mu.Lock()
@@ -402,6 +389,12 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 			if err == io.EOF {
 				log.Printf("🎉 [STREAM-END] Reached natural EOF of audio stream. Sent total of %d packets.", frameCount)
 				break 
+			}
+			
+			// If FFmpeg errored mid-stream, grab the exact stderr
+			stderrStr := strings.TrimSpace(ffmpegStderr.String())
+			if stderrStr != "" {
+				return fmt.Errorf("error during frame transcode stream loop: %w (ffmpeg context: %s)", err, stderrStr)
 			}
 			return fmt.Errorf("error reading next frame slice from dca buffer stream: %w", err)
 		}
