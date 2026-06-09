@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os/exec"
 	"strings"
@@ -240,109 +239,60 @@ func (p *GuildPlayer) runPlaybackLoop() {
 	rdb.ClearPlayerState(ctx, p.GuildID)
 }
 
-// playTrack streams a single track using automated cheezecakee/dca streaming loop abstractions.
-// playTrack streams a track safely by passing verified pathways to dca.EncodeFile.
 func (p *GuildPlayer) playTrack(track *QueueTrack) error {
-	ctx := context.Background()
-	var minioStream io.ReadCloser
-
+	ctx, cancel := context.WithCancel(context.Background())
 	p.mu.Lock()
-	playCtx, cancel := context.WithCancel(context.Background())
-	p.playCtx = playCtx
+	p.playCtx = ctx
 	p.cancelPlay = cancel
 	p.mu.Unlock()
 
 	defer func() {
-		log.Printf("🔲 [TRACK-END] Running deferred cleanup blocks for stream...")
 		cancel()
 		p.mu.Lock()
 		p.streamSession = nil
-		if minioStream != nil {
-			log.Println("🔲 [TRACK-END] Closing direct MinIO socket streams...")
-			minioStream.Close()
-		}
 		p.mu.Unlock()
 	}()
 
-	// Load stable default library configurations
-	opts := dca.StdEncodeOptions
-	opts.Bitrate = 96
-	opts.CompressionLevel = 10
-
-	var targetPath string
-	var err error
-
-	if track.Source == "minio" {
-		log.Printf("📦 [STREAM] Source identified as MinIO. Resolving mapping for link: %s", track.URL)
-		minioStream, err = minioClient.GetLibrarySong(ctx, track.URL)
-		if err != nil {
-			return fmt.Errorf("fetching custom track from MinIO: %w", err)
-		}
-
-		// For memory streams, we write to a temporary file locally or pipe it
-		// If MinIO links are public or signed presigned URLs, pass the URL directly to targetPath instead!
-		targetPath = track.URL
-	} else {
-		log.Printf("🌐 [STREAM] Source identified as Web/YT. Resolving link via yt-dlp: '%s'", track.URL)
-		streamURL, resolveErr := resolveWithYtDlp(track.URL)
-		if resolveErr != nil {
-			return fmt.Errorf("resolving web audio source with yt-dlp: %w", resolveErr)
-		}
-		if streamURL == "" {
-			return fmt.Errorf("yt-dlp engine completed but returned an empty stream URL string")
-		}
-		targetPath = streamURL
+	// 1. Get the direct stream URL from yt-dlp
+	streamURL, err := resolveWithYtDlp(track.URL)
+	if err != nil {
+		return fmt.Errorf("yt-dlp failed: %w", err)
 	}
 
-	// ASYNCHRONOUS: EncodeFile handles spawning its own unblocking background context process
-	log.Printf("🎛️ [DCA] Spawning background file transcoding worker for target: %s", targetPath)
-	encSession, err := dca.EncodeFile(targetPath, opts)
+	// 2. Use the library's official entry point
+	// The library handles spawning FFmpeg with the correct parameters internally
+	opts := dca.StdEncodeOptions
+	opts.Bitrate = 96
+
+	log.Printf("🎛️ [DCA] Encoding URL: %s", streamURL)
+	encSession, err := dca.EncodeFile(streamURL, opts)
 	if err != nil {
-		return fmt.Errorf("transcoding execution memory translation failure: %w", err)
+		return fmt.Errorf("dca.EncodeFile failed: %w", err)
 	}
 	defer encSession.Cleanup()
 
+	// 3. Setup voice connection
 	p.mu.Lock()
 	vc := p.voiceConn
 	p.mu.Unlock()
 
-	// ASSERT SPEAKING VOICE FLAG BEFORE STARTING THE STREAM
-	log.Println("🎤 [DISCORD-VOICE] Asserting speaking state to gateway...")
-	if err := vc.Speaking(true); err != nil {
-		log.Printf("⚠️ [DISCORD-VOICE] Warning: Failed to assert voice gateway payload speaking token: %v", err)
-	}
-	defer func() {
-		log.Println("🎤 [DISCORD-VOICE] Stripping active transmission gateway flag tokens.")
-		_ = vc.Speaking(false)
-	}()
+	_ = vc.Speaking(true)
+	defer func() { _ = vc.Speaking(false) }()
 
-	rdb.SetPlayerState(ctx, p.GuildID, map[string]interface{}{
-		"current_song_title": fmt.Sprintf("**%s** - %s (Requested by: %s)", track.Title, track.Artist, track.RequestedBy),
-		"is_paused":          "false",
-	})
-
-	log.Printf("🎼 [STREAM-START] Beginning automated binary packet loop delivery for: '%s'", track.Title)
-
+	// 4. Create the stream
 	doneChan := make(chan error, 1)
 	stream := dca.NewStream(encSession, vc, doneChan)
 
 	p.mu.Lock()
 	p.streamSession = stream
-	p.isPaused = false
 	p.mu.Unlock()
 
 	select {
-	case <-playCtx.Done():
-		log.Println("🛑 [STREAM-LOOP] Context canceled. Stopping loop delivery.")
+	case <-ctx.Done():
 		return fmt.Errorf("playback interrupted")
-	case streamErr := <-doneChan:
-		if streamErr != nil && streamErr != io.EOF {
-			return fmt.Errorf("stream context ran into active loop crash: %w", streamErr)
-		}
-		log.Println("🎉 [STREAM-END] Stream playback finished cleanly.")
+	case err := <-doneChan:
+		return err
 	}
-
-	return nil
 }
 
 // sendError posts a red embed to the text channel.

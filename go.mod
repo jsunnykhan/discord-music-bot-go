@@ -10,17 +10,13 @@ require (
 	github.com/redis/go-redis/v9 v9.20.0
 )
 
-replace github.com/bwmarrin/discordgo => github.com/yeongaori/discordgo-fork v0.0.0-20260523084716-86ad19e070d2
-
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cheezecakee/dca v0.0.0-20240722231258-f89cad9038bb // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/jogramming/ogg v0.0.0-20161220051205-b4f6f4cf3757 // indirect
-	github.com/jonas747/ogg v0.0.0-20161220051205-b4f6f4cf3757 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.11 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
@@ -38,3 +34,5 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	gopkg.in/ini.v1 v1.67.2 // indirect
 )
+
+replace github.com/bwmarrin/discordgo => github.com/yeongaori/discordgo-fork v0.0.0-20260523084716-86ad19e070d2
