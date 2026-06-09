@@ -38,7 +38,7 @@ var (
 // GetOrCreatePlayer retrieves or initialises the player for a guild.
 func GetOrCreatePlayer(guildID string, s *discordgo.Session) *GuildPlayer {
 	playersMu.Lock()
-	defer playersMu.Unlock()
+	defer playersMu.Unlock() 
 
 	p, ok := players[guildID]
 	if !ok {
@@ -60,14 +60,14 @@ func (p *GuildPlayer) Join(channelID string) error {
 	}
 
 	log.Printf("🔌 [INFO] Attempting to join voice channel %s (Guild: %s)...", channelID, p.GuildID)
-	
+
 	// Set manual engine flag (last parameter to false) to allow direct chunk delivery
 	vc, err := p.session.ChannelVoiceJoin(context.Background(), p.GuildID, channelID, false, false)
 	if err != nil {
 		log.Printf("❌ [ERROR] Failed to join voice channel %s: %v", channelID, err)
 		return fmt.Errorf("joining voice channel %s: %w", channelID, err)
 	}
-	
+
 	p.voiceConn = vc
 	p.voiceChannelID = channelID
 	log.Printf("✅ [SUCCESS] Successfully connected to voice channel %s", channelID)
@@ -86,12 +86,12 @@ func (p *GuildPlayer) Leave() error {
 
 	log.Printf("🚪 [INFO] Leaving voice channel %s (Guild: %s)", p.voiceChannelID, p.GuildID)
 	p.stopPlaybackLocked()
-	
+
 	err := p.voiceConn.Disconnect(context.Background())
 	if err != nil {
 		log.Printf("❌ [ERROR] Error occurred during voice disconnect: %v", err)
 	}
-	
+
 	p.voiceConn = nil
 	p.isPlaying = false
 	p.isPaused = false
@@ -139,7 +139,7 @@ func (p *GuildPlayer) Pause() error {
 		log.Printf("ℹ️ [INFO] Pause requested, but playback is already paused.")
 		return nil
 	}
-	
+
 	p.isPaused = true
 	log.Printf("⏸️ [INFO] Playback paused for Guild %s", p.GuildID)
 
@@ -160,7 +160,7 @@ func (p *GuildPlayer) Resume() error {
 		log.Printf("ℹ️ [INFO] Resume requested, but playback is already running.")
 		return nil
 	}
-	
+
 	p.isPaused = false
 	log.Printf("▶️ [INFO] Playback resumed for Guild %s", p.GuildID)
 
@@ -178,7 +178,7 @@ func (p *GuildPlayer) Stop() error {
 	if err := rdb.ClearQueue(ctx, p.GuildID); err != nil {
 		log.Printf("⚠️ [WARN] Error clearing Redis queue on stop: %v", err)
 	}
-	
+
 	p.stopPlaybackLocked()
 	rdb.ClearPlayerState(ctx, p.GuildID)
 	log.Printf("✅ [SUCCESS] Active streams closed and state cleared for Guild %s", p.GuildID)
@@ -243,7 +243,7 @@ func (p *GuildPlayer) runPlaybackLoop() {
 	rdb.ClearPlayerState(ctx, p.GuildID)
 }
 
-// playTrack streams a single track through Discord voice.
+// playTrack streams a single track through Discord voice using a robust Unix Named Pipe.
 func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	ctx := context.Background()
 	var minioStream io.ReadCloser
@@ -253,6 +253,12 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	p.playCtx = playCtx
 	p.cancelPlay = cancel
 	p.mu.Unlock()
+
+	// Unique named pipe path inside the Docker container's temporary directory
+	fifoPath := fmt.Sprintf("/tmp/discord_audio_%s_%d.fifo", p.GuildID, time.Now().UnixNano())
+
+	// Native Linux command to create a secure named pipe
+	_ = exec.Command("mkfifo", fifoPath).Run()
 
 	defer func() {
 		log.Printf("🔲 [TRACK-END] Running deferred cleanup blocks for stream...")
@@ -268,6 +274,9 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 			minioStream.Close()
 		}
 		p.mu.Unlock()
+
+		// Remove the temporary named pipe from the container storage filesystem
+		_ = exec.Command("rm", "-f", fifoPath).Run()
 	}()
 
 	opts := dca.StdEncodeOptions
@@ -284,8 +293,9 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		if err != nil {
 			return fmt.Errorf("fetching custom track from MinIO: %w", err)
 		}
-		
-		ffmpegCmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "-nostats", "pipe:1")
+
+		// Directing output straight into our named pipe file
+		ffmpegCmd = exec.Command("ffmpeg", "-y", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "-nostats", fifoPath)
 		ffmpegCmd.Stdin = minioStream
 	} else {
 		log.Printf("🌐 [STREAM] Source identified as Web/YT. Resolving link via yt-dlp: '%s'", track.URL)
@@ -293,44 +303,36 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		if resolveErr != nil {
 			return fmt.Errorf("resolving web audio source with yt-dlp: %w", resolveErr)
 		}
-		
+
 		if streamURL == "" {
 			return fmt.Errorf("yt-dlp engine completed but returned an empty stream URL string")
 		}
 
 		log.Printf("🔗 [STREAM] yt-dlp link extraction resolved successfully. Length: %d chars", len(streamURL))
-		
-		// Configured with implicit streaming reconnect overrides to guard fluid transfers from dropouts
-		ffmpegCmd = exec.Command("ffmpeg", 
-			"-reconnect", "1", 
-			"-reconnect_streamed", "1", 
-			"-reconnect_delay_max", "5", 
-			"-i", streamURL, 
-			"-f", "s16le", 
-			"-ar", "48000", 
-			"-ac", "2", 
-			"-loglevel", "error", 
-			"-nostats", 
-			"pipe:1",
+
+		// FFmpeg streams directly to the FIFO path instead of standard pipe output
+		ffmpegCmd = exec.Command("ffmpeg", "-y",
+			"-reconnect", "1",
+			"-reconnect_streamed", "1",
+			"-reconnect_delay_max", "5",
+			"-i", streamURL,
+			"-f", "s16le",
+			"-ar", "48000",
+			"-ac", "2",
+			"-loglevel", "error",
+			"-nostats",
+			fifoPath,
 		)
 	}
 
-	// Create a pipe to read raw PCM bytes from stdout
-	ffmpegStdout, err := ffmpegCmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("creating internal ffmpeg stdout allocation pipe: %w", err)
-	}
-
-	// Capture logging output if FFmpeg errors out or rejects the incoming connection parameters
 	var ffmpegStderr bytes.Buffer
 	ffmpegCmd.Stderr = &ffmpegStderr
 
-	log.Println("🎬 [FFMPEG] Initializing external FFmpeg engine process...")
+	log.Println("🎬 [FFMPEG] Initializing external FFmpeg engine process targeting FIFO...")
 	if err := ffmpegCmd.Start(); err != nil {
 		return fmt.Errorf("failed to execute background ffmpeg context instantiation: %w", err)
 	}
 
-	// Clean kill if processing exits early
 	defer func() {
 		if ffmpegCmd.Process != nil {
 			log.Println("🎬 [FFMPEG] Terminating background FFmpeg worker sub-process.")
@@ -338,15 +340,15 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		}
 	}()
 
-	log.Println("🎛️ [DCA] Compiling raw binary pipe into DCA memory framework structure...")
-	encSession, err := dca.EncodeMem(ffmpegStdout, opts)
+	// EncodeFile reads from the Unix FIFO. This lets DCA initialize cleanly without early EOF drops.
+	log.Println("🎛️ [DCA] Compiling FIFO file target into DCA tracking structure...")
+	encSession, err := dca.EncodeFile(fifoPath, opts)
 	if err != nil {
 		stderrStr := strings.TrimSpace(ffmpegStderr.String())
-		log.Printf("❌ [FFMPEG-CRASH] Underlying process log error caught during EncodeMem: %s", stderrStr)
+		log.Printf("❌ [FFMPEG-CRASH] Underlying process log error caught during EncodeFile: %s", stderrStr)
 		return fmt.Errorf("transcoding execution memory translation failure: %w (stderr: %s)", err, stderrStr)
 	}
 
-	// Brief sleep evaluation context block to verify if internal pipeline threw error warnings
 	time.Sleep(150 * time.Millisecond)
 	if ffmpegStderr.Len() > 0 {
 		log.Printf("⚠️ [FFMPEG-WARN] Process generated error output during initialization: %s", strings.TrimSpace(ffmpegStderr.String()))
@@ -367,7 +369,6 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		_ = vc.Speaking(false)
 	}()
 
-	// Publish "now playing" state in Redis.
 	rdb.SetPlayerState(ctx, p.GuildID, map[string]interface{}{
 		"current_song_title": fmt.Sprintf("**%s** - %s (Requested by: %s)", track.Title, track.Artist, track.RequestedBy),
 		"is_paused":          "false",
@@ -376,7 +377,6 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	log.Printf("🎼 [STREAM-START] Beginning binary packet loop delivery for: '%s'", track.Title)
 	frameCount := 0
 
-	// Frame-copy loop directly to the Opus Engine channel
 	for {
 		select {
 		case <-playCtx.Done():
@@ -398,7 +398,7 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		if err != nil {
 			if err == io.EOF {
 				log.Printf("🎉 [STREAM-END] Reached natural EOF of audio stream. Sent total of %d packets.", frameCount)
-				break // End of track
+				break
 			}
 			return fmt.Errorf("error reading next frame slice from dca buffer stream: %w", err)
 		}
@@ -406,7 +406,6 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		select {
 		case vc.OpusSend <- frame:
 			frameCount++
-			// Print log snapshot trace every 500 packets so console stays readable but verified active
 			if frameCount%500 == 0 {
 				log.Printf("🔊 [STREAM-TRACE] Successfully routed %d packets into Opus Engine queue buffers...", frameCount)
 			}
@@ -442,8 +441,7 @@ func resolveWithYtDlp(target string) (string, error) {
 	}
 
 	log.Printf("🔍 [YT-DLP] Executing native binary call for: %s", target)
-	
-	// Executed straight via native call arrays to side-step string shell escaping logic bugs inside docker
+
 	cmd := exec.Command("/usr/local/bin/yt-dlp", "-f", "bestaudio", "-g", target)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
