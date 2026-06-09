@@ -8,15 +8,16 @@ RUN go mod download
 COPY src/ ./src/
 RUN CGO_ENABLED=0 GOOS=linux go build -o discord-music-bot ./src/
 
-# Stage 2: Final lightweight image using Debian-Slim (Includes GLIBC for audio engines)
+# Stage 2: Final lightweight image using Debian-Slim
 FROM debian:bookworm-slim
 
-# Install system dependencies and clean up apt cache to keep image small
+# Install system dependencies, enforce certificate updates, and clean apt cache
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     ca-certificates \
     python3 \
     wget \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Download the absolute latest release of yt-dlp into standard binary path
@@ -24,9 +25,6 @@ RUN wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /us
     && chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app
-
-# Copy the compiled binary from stage 1
 COPY --from=builder /app/discord-music-bot .
 
-# Command to run the bot
 ENTRYPOINT ["./discord-music-bot"]
