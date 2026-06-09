@@ -60,14 +60,14 @@ func (p *GuildPlayer) Join(channelID string) error {
 	}
 
 	log.Printf("🔌 [INFO] Attempting to join voice channel %s (Guild: %s)...", channelID, p.GuildID)
-
+	
 	// Set manual engine flag (last parameter to false) to allow direct chunk delivery
 	vc, err := p.session.ChannelVoiceJoin(context.Background(), p.GuildID, channelID, false, false)
 	if err != nil {
 		log.Printf("❌ [ERROR] Failed to join voice channel %s: %v", channelID, err)
 		return fmt.Errorf("joining voice channel %s: %w", channelID, err)
 	}
-
+	
 	p.voiceConn = vc
 	p.voiceChannelID = channelID
 	log.Printf("✅ [SUCCESS] Successfully connected to voice channel %s", channelID)
@@ -86,12 +86,12 @@ func (p *GuildPlayer) Leave() error {
 
 	log.Printf("🚪 [INFO] Leaving voice channel %s (Guild: %s)", p.voiceChannelID, p.GuildID)
 	p.stopPlaybackLocked()
-
+	
 	err := p.voiceConn.Disconnect(context.Background())
 	if err != nil {
 		log.Printf("❌ [ERROR] Error occurred during voice disconnect: %v", err)
 	}
-
+	
 	p.voiceConn = nil
 	p.isPlaying = false
 	p.isPaused = false
@@ -139,7 +139,7 @@ func (p *GuildPlayer) Pause() error {
 		log.Printf("ℹ️ [INFO] Pause requested, but playback is already paused.")
 		return nil
 	}
-
+	
 	p.isPaused = true
 	log.Printf("⏸️ [INFO] Playback paused for Guild %s", p.GuildID)
 
@@ -160,7 +160,7 @@ func (p *GuildPlayer) Resume() error {
 		log.Printf("ℹ️ [INFO] Resume requested, but playback is already running.")
 		return nil
 	}
-
+	
 	p.isPaused = false
 	log.Printf("▶️ [INFO] Playback resumed for Guild %s", p.GuildID)
 
@@ -178,7 +178,7 @@ func (p *GuildPlayer) Stop() error {
 	if err := rdb.ClearQueue(ctx, p.GuildID); err != nil {
 		log.Printf("⚠️ [WARN] Error clearing Redis queue on stop: %v", err)
 	}
-
+	
 	p.stopPlaybackLocked()
 	rdb.ClearPlayerState(ctx, p.GuildID)
 	log.Printf("✅ [SUCCESS] Active streams closed and state cleared for Guild %s", p.GuildID)
@@ -284,8 +284,8 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		if err != nil {
 			return fmt.Errorf("fetching custom track from MinIO: %w", err)
 		}
-
-		ffmpegCmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "quiet", "-nostats", "pipe:1")
+		
+		ffmpegCmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "error", "-nostats", "pipe:1")
 		ffmpegCmd.Stdin = minioStream
 	} else {
 		log.Printf("🌐 [STREAM] Source identified as Web/YT. Resolving link via yt-dlp: '%s'", track.URL)
@@ -293,13 +293,26 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		if resolveErr != nil {
 			return fmt.Errorf("resolving web audio source with yt-dlp: %w", resolveErr)
 		}
-
+		
 		if streamURL == "" {
 			return fmt.Errorf("yt-dlp engine completed but returned an empty stream URL string")
 		}
 
 		log.Printf("🔗 [STREAM] yt-dlp link extraction resolved successfully. Length: %d chars", len(streamURL))
-		ffmpegCmd = exec.Command("ffmpeg", "-i", streamURL, "-f", "s16le", "-ar", "48000", "-ac", "2", "-loglevel", "quiet", "-nostats", "pipe:1")
+		
+		// Configured with implicit streaming reconnect overrides to guard fluid transfers from dropouts
+		ffmpegCmd = exec.Command("ffmpeg", 
+			"-reconnect", "1", 
+			"-reconnect_streamed", "1", 
+			"-reconnect_delay_max", "5", 
+			"-i", streamURL, 
+			"-f", "s16le", 
+			"-ar", "48000", 
+			"-ac", "2", 
+			"-loglevel", "error", 
+			"-nostats", 
+			"pipe:1",
+		)
 	}
 
 	// Create a pipe to read raw PCM bytes from stdout
@@ -308,7 +321,7 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 		return fmt.Errorf("creating internal ffmpeg stdout allocation pipe: %w", err)
 	}
 
-	// Capture errors if FFmpeg breaks before the pipe stream runs
+	// Capture logging output if FFmpeg errors out or rejects the incoming connection parameters
 	var ffmpegStderr bytes.Buffer
 	ffmpegCmd.Stderr = &ffmpegStderr
 
@@ -329,8 +342,14 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	encSession, err := dca.EncodeMem(ffmpegStdout, opts)
 	if err != nil {
 		stderrStr := strings.TrimSpace(ffmpegStderr.String())
-		log.Printf("❌ [FFMPEG-CRASH] Underlying process log error caught: %s", stderrStr)
+		log.Printf("❌ [FFMPEG-CRASH] Underlying process log error caught during EncodeMem: %s", stderrStr)
 		return fmt.Errorf("transcoding execution memory translation failure: %w (stderr: %s)", err, stderrStr)
+	}
+
+	// Brief sleep evaluation context block to verify if internal pipeline threw error warnings
+	time.Sleep(150 * time.Millisecond)
+	if ffmpegStderr.Len() > 0 {
+		log.Printf("⚠️ [FFMPEG-WARN] Process generated error output during initialization: %s", strings.TrimSpace(ffmpegStderr.String()))
 	}
 
 	p.mu.Lock()
@@ -423,8 +442,8 @@ func resolveWithYtDlp(target string) (string, error) {
 	}
 
 	log.Printf("🔍 [YT-DLP] Executing native binary call for: %s", target)
-
-	// Native invocation bypasses shell double-quoting bugs entirely
+	
+	// Executed straight via native call arrays to side-step string shell escaping logic bugs inside docker
 	cmd := exec.Command("/usr/local/bin/yt-dlp", "-f", "bestaudio", "-g", target)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
