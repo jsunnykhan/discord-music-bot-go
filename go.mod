@@ -1,0 +1,38 @@
+module discord-music-bot
+
+go 1.26.3
+
+require (
+	github.com/bwmarrin/discordgo v0.29.0
+	github.com/jonas747/dca v0.0.0-20210930103944-155f5e5f0cc7
+	github.com/lib/pq v1.12.3
+	github.com/minio/minio-go/v7 v7.2.0
+	github.com/redis/go-redis/v9 v9.20.0
+)
+
+replace github.com/bwmarrin/discordgo => github.com/yeongaori/discordgo-fork v0.0.0-20260523084716-86ad19e070d2
+
+require (
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/cloudflare/circl v1.6.3 // indirect
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/jonas747/ogg v0.0.0-20161220051205-b4f6f4cf3757 // indirect
+	github.com/klauspost/compress v1.18.6 // indirect
+	github.com/klauspost/cpuid/v2 v2.2.11 // indirect
+	github.com/klauspost/crc32 v1.3.0 // indirect
+	github.com/minio/crc64nvme v1.1.1 // indirect
+	github.com/minio/md5-simd v1.1.2 // indirect
+	github.com/philhofer/fwd v1.2.0 // indirect
+	github.com/rs/xid v1.6.0 // indirect
+	github.com/tinylib/msgp v1.6.1 // indirect
+	github.com/zeebo/xxh3 v1.1.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/sys v0.44.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
+	gopkg.in/ini.v1 v1.67.2 // indirect
+)
