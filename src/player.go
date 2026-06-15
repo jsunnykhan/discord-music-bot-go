@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/cheezecakee/dca"
 )
 
 // GuildPlayer manages voice connections and audio playback for one guild.
@@ -19,7 +21,7 @@ type GuildPlayer struct {
 	mu             sync.Mutex
 	session        *discordgo.Session
 	voiceConn      *discordgo.VoiceConnection
-	streamSession  *dca.StreamingSession
+	ffmpegCmd      *exec.Cmd
 	isPlaying      bool
 	isPaused       bool
 	voiceChannelID string
@@ -123,12 +125,12 @@ func (p *GuildPlayer) Play(track *QueueTrack, textChannelID string) error {
 	return nil
 }
 
-// Pause pauses the current stream via the StreamingSession interface.
+// Pause pauses the current ffmpeg process.
 func (p *GuildPlayer) Pause() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.isPlaying || p.streamSession == nil {
+	if !p.isPlaying || p.ffmpegCmd == nil || p.ffmpegCmd.Process == nil {
 		log.Printf("⚠️ [WARN] Pause requested, but nothing is currently playing in Guild %s", p.GuildID)
 		return fmt.Errorf("nothing is playing")
 	}
@@ -138,19 +140,21 @@ func (p *GuildPlayer) Pause() error {
 	}
 
 	p.isPaused = true
-	p.streamSession.SetPaused(true)
+	if err := p.ffmpegCmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		log.Printf("⚠️ [WARN] Failed to pause ffmpeg process: %v", err)
+	}
 	log.Printf("⏸️ [INFO] Playback paused for Guild %s", p.GuildID)
 
 	rdb.SetPlayerState(context.Background(), p.GuildID, map[string]interface{}{"is_paused": "true"})
 	return nil
 }
 
-// Resume unpauses the current stream via the StreamingSession interface.
+// Resume unpauses the current ffmpeg process.
 func (p *GuildPlayer) Resume() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.isPlaying || p.streamSession == nil {
+	if !p.isPlaying || p.ffmpegCmd == nil || p.ffmpegCmd.Process == nil {
 		log.Printf("⚠️ [WARN] Resume requested, but nothing is playing in Guild %s", p.GuildID)
 		return fmt.Errorf("nothing is playing")
 	}
@@ -160,7 +164,9 @@ func (p *GuildPlayer) Resume() error {
 	}
 
 	p.isPaused = false
-	p.streamSession.SetPaused(false)
+	if err := p.ffmpegCmd.Process.Signal(syscall.SIGCONT); err != nil {
+		log.Printf("⚠️ [WARN] Failed to resume ffmpeg process: %v", err)
+	}
 	log.Printf("▶️ [INFO] Playback resumed for Guild %s", p.GuildID)
 
 	rdb.SetPlayerState(context.Background(), p.GuildID, map[string]interface{}{"is_paused": "false"})
@@ -191,7 +197,10 @@ func (p *GuildPlayer) stopPlaybackLocked() {
 		p.cancelPlay()
 		p.cancelPlay = nil
 	}
-	p.streamSession = nil
+	if p.ffmpegCmd != nil && p.ffmpegCmd.Process != nil {
+		_ = p.ffmpegCmd.Process.Kill()
+	}
+	p.ffmpegCmd = nil
 	p.isPaused = false
 }
 
@@ -249,50 +258,189 @@ func (p *GuildPlayer) playTrack(track *QueueTrack) error {
 	defer func() {
 		cancel()
 		p.mu.Lock()
-		p.streamSession = nil
+		p.ffmpegCmd = nil
 		p.mu.Unlock()
 	}()
 
-	// 1. Get the direct stream URL from yt-dlp
+	// 1. Resolve URL via yt-dlp
 	streamURL, err := resolveWithYtDlp(track.URL)
 	if err != nil {
 		return fmt.Errorf("yt-dlp failed: %w", err)
 	}
 
-	// 2. Use the library's official entry point
-	// The library handles spawning FFmpeg with the correct parameters internally
-	opts := dca.StdEncodeOptions
-	opts.Bitrate = 96
-
-	log.Printf("🎛️ [DCA] Encoding URL: %s", streamURL)
-	encSession, err := dca.EncodeFile(streamURL, opts)
-	if err != nil {
-		return fmt.Errorf("dca.EncodeFile failed: %w", err)
-	}
-	defer encSession.Cleanup()
-
-	// 3. Setup voice connection
+	// 2. Setup voice connection
 	p.mu.Lock()
 	vc := p.voiceConn
 	p.mu.Unlock()
 
+	if vc == nil {
+		return fmt.Errorf("voice connection is nil")
+	}
+
 	_ = vc.Speaking(true)
 	defer func() { _ = vc.Speaking(false) }()
 
-	// 4. Create the stream
-	doneChan := make(chan error, 1)
-	stream := dca.NewStream(encSession, vc, doneChan)
+	// 3. Run ffmpeg as a subprocess
+	log.Printf("🎵 [FFMPEG] Starting ffmpeg subprocess for: %s", streamURL)
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner",
+		"-loglevel", "warning",
+		"-i", streamURL,
+		"-f", "opus",
+		"-c:a", "libopus",
+		"-ar", "48000",
+		"-ac", "2",
+		"-b:a", "128k",
+		"-application", "audio",
+		"-frame_duration", "20",
+		"-vbr", "on",
+		"pipe:1",
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start ffmpeg: %w", err)
+	}
 
 	p.mu.Lock()
-	p.streamSession = stream
+	p.ffmpegCmd = cmd
 	p.mu.Unlock()
 
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("playback interrupted")
-	case err := <-doneChan:
-		return err
+	// Ensure ffmpeg is killed when done
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		errStr := strings.TrimSpace(stderr.String())
+		if errStr != "" {
+			log.Printf("⚠️ [FFMPEG] stderr: %s", errStr)
+		}
+	}()
+
+	// 4. Parse OGG pages manually to extract Opus frames
+	log.Printf("🔍 [OGG] Starting OGG page parsing...")
+	frameCount := 0
+	headerPackets := 0
+	var packetBuf []byte
+	lastLogTime := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("🛑 [OGG] Context cancelled during page parsing")
+			return fmt.Errorf("playback interrupted")
+		default:
+		}
+
+		// Read OGG page header (27 bytes minimum)
+		var header [27]byte
+		_, err := io.ReadFull(stdout, header[:])
+		if err != nil {
+			if err == io.EOF {
+				log.Printf("✅ [OGG] End of stream after %d frames", frameCount)
+				break
+			}
+			log.Printf("❌ [OGG] Error reading page header: %v", err)
+			return fmt.Errorf("reading OGG header: %w", err)
+		}
+
+		// Verify capture pattern "OggS"
+		if string(header[0:4]) != "OggS" {
+			log.Printf("❌ [OGG] Invalid capture pattern: %q", string(header[0:4]))
+			return fmt.Errorf("invalid OGG capture pattern")
+		}
+
+		// Parse header fields
+		headerType := header[5]
+		nsegs := header[26]
+
+		// Read segment table
+		segTable := make([]byte, nsegs)
+		_, err = io.ReadFull(stdout, segTable)
+		if err != nil {
+			log.Printf("❌ [OGG] Error reading segment table: %v", err)
+			return fmt.Errorf("reading segment table: %w", err)
+		}
+
+		// Calculate total page data size
+		pageDataSize := 0
+		for _, seg := range segTable {
+			pageDataSize += int(seg)
+		}
+
+		// Read page data
+		pageData := make([]byte, pageDataSize)
+		_, err = io.ReadFull(stdout, pageData)
+		if err != nil {
+			log.Printf("❌ [OGG] Error reading page data: %v", err)
+			return fmt.Errorf("reading page data: %w", err)
+		}
+
+		// Extract packets using OGG segment lacing:
+		// Segment size 255 = packet continues in next segment
+		// Segment size < 255 = end of packet
+		dataPos := 0
+		for segIdx := 0; segIdx < int(nsegs); segIdx++ {
+			segSize := int(segTable[segIdx])
+			if dataPos+segSize > len(pageData) {
+				break
+			}
+
+			packetBuf = append(packetBuf, pageData[dataPos:dataPos+segSize]...)
+			dataPos += segSize
+
+			// If segment < 255, this terminates the current packet
+			if segSize < 255 {
+				packet := make([]byte, len(packetBuf))
+				copy(packet, packetBuf)
+				packetBuf = packetBuf[:0]
+
+				// Skip first 2 header packets (OpusHead and OpusTags)
+				if headerPackets < 2 {
+					headerPackets++
+					log.Printf("📋 [OGG] Skipping header packet %d (size: %d bytes)", headerPackets, len(packet))
+					continue
+				}
+
+				// Send complete opus frame to Discord
+				frameCount++
+				if frameCount <= 5 || frameCount%100 == 0 {
+					log.Printf("🎵 [OGG] Sending frame #%d (size: %d bytes)", frameCount, len(packet))
+				}
+
+				// Log frame timing every second
+				if time.Since(lastLogTime) >= time.Second {
+					log.Printf("📊 [OGG] Sent %d frames so far", frameCount)
+					lastLogTime = time.Now()
+				}
+
+				select {
+				case vc.OpusSend <- packet:
+				case <-time.After(2 * time.Second):
+					log.Printf("⚠️ [OGG] Timeout sending frame #%d to OpusSend", frameCount)
+					return fmt.Errorf("timeout sending frame to OpusSend")
+				case <-ctx.Done():
+					return fmt.Errorf("playback interrupted")
+				}
+			}
+		}
+
+		// Check for end of stream
+		if headerType&0x04 != 0 {
+			log.Printf("✅ [OGG] End of stream flag detected after %d frames", frameCount)
+			break
+		}
 	}
+
+	log.Printf("✅ [OGG] Finished streaming %d opus frames to Discord", frameCount)
+	return nil
 }
 
 // sendError posts a red embed to the text channel.
